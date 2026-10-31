@@ -1,7 +1,7 @@
 # Speed Optimizer - Crystal + Anchor optimizer, speed 1-10 (Fabric 1.21.11, client-side)
 
 ## Build
-Needs JDK 21 and Gradle 8.14+ (or drop src/ into the Fabric 1.21.11 example mod).
+Needs JDK 21 and Gradle 9.2+ (or drop src/ into the Fabric 1.21.11 example mod).
   gradle build
 Jar: build/libs/speedoptimizer-1.2.0+mc1.21.11.jar -> put in .minecraft/mods
 Fabric API is NOT needed, only Fabric Loader 0.18+.
