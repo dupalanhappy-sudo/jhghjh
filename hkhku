@@ -1,0 +1,380 @@
+org.gradle.jvmargs=-Xmx2G
+mc=1.21.11
+loader_version=0.18.4
+mod_version=1.2.0
+
+package com.speedopt.mixin;
+
+import com.speedopt.SpeedOpt;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.RespawnAnchorBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+@Mixin(MultiPlayerGameMode.class)
+public class InteractionManagerMixin {
+
+    @Unique private long speedopt$lastCrystal = -1000;
+    @Unique private long speedopt$lastAnchor = -1000;
+    @Unique private boolean speedopt$anchorExploding = false;
+
+    /* ---------------- CRYSTAL OPTIMIZER ---------------- */
+
+    @Inject(method = "attack", at = @At("HEAD"), cancellable = true)
+    private void speedopt$crystalHead(Player player, Entity target, CallbackInfo ci) {
+        if (!SpeedOpt.config.enabled || !SpeedOpt.config.crystalEnabled) return;
+        if (!(target instanceof EndCrystal)) return;
+
+        // Speed level: ignore hits that come faster than the chosen delay
+        long now = SpeedOpt.now();
+        if (now - speedopt$lastCrystal < SpeedOpt.config.crystalDelay()) {
+            ci.cancel();
+            return;
+        }
+        speedopt$lastCrystal = now;
+    }
+
+    @Inject(method = "attack", at = @At("TAIL"))
+    private void speedopt$crystalTail(Player player, Entity target, CallbackInfo ci) {
+        if (!SpeedOpt.config.enabled || !SpeedOpt.config.crystalEnabled) return;
+        if (!(target instanceof EndCrystal)) return;
+
+        // Remove the crystal on the client immediately so the next one can be placed
+        // without waiting for the server's removal packet.
+        target.remove(Entity.RemovalReason.KILLED);
+    }
+
+    /* ---------------- ANCHOR OPTIMIZER ---------------- */
+
+    @Inject(method = "useItemOn", at = @At("HEAD"), cancellable = true)
+    private void speedopt$anchorHead(LocalPlayer player, InteractionHand hand, BlockHitResult hit,
+                                     CallbackInfoReturnable<InteractionResult> cir) {
+        speedopt$anchorExploding = false;
+        if (!SpeedOpt.config.enabled || !SpeedOpt.config.anchorEnabled) return;
+
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) return;
+
+        BlockPos pos = hit.getBlockPos();
+        BlockState state = level.getBlockState(pos);
+        if (!state.is(Blocks.RESPAWN_ANCHOR)) return;
+        if (state.getValue(RespawnAnchorBlock.CHARGE) <= 0) return;
+        if (player.getItemInHand(hand).is(Items.GLOWSTONE)) return; // charging, not exploding
+        if (level.dimension() == Level.NETHER) return;              // anchors only work in the Nether, explode elsewhere
+
+        long now = SpeedOpt.now();
+        if (now - speedopt$lastAnchor < SpeedOpt.config.anchorDelay()) {
+            cir.setReturnValue(InteractionResult.FAIL);
+            return;
+        }
+        speedopt$lastAnchor = now;
+        speedopt$anchorExploding = true;
+    }
+
+    @Inject(method = "useItemOn", at = @At("RETURN"))
+    private void speedopt$anchorReturn(LocalPlayer player, InteractionHand hand, BlockHitResult hit,
+                                       CallbackInfoReturnable<InteractionResult> cir) {
+        if (!speedopt$anchorExploding) return;
+        speedopt$anchorExploding = false;
+        if (!cir.getReturnValue().consumesAction()) return;
+
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) return;
+        // Clear the anchor on the client immediately so the next one can be placed instantly.
+        level.setBlock(hit.getBlockPos(), Blocks.AIR.defaultBlockState(), 11);
+    }
+}
+
+# Speed Optimizer - Crystal + Anchor optimizer, speed 1-10 (Fabric 1.21.11, client-side)
+
+## Build
+Needs JDK 21 and Gradle 9.2+ (or drop src/ into the Fabric 1.21.11 example mod).
+  gradle build
+Jar: build/libs/speedoptimizer-1.2.0+mc1.21.11.jar -> put in .minecraft/mods
+Fabric API is NOT needed, only Fabric Loader 0.18+.
+
+## Chat commands (never sent to the server)
+.speedopt crystal <1-10>
+.speedopt anchor <1-10>
+.speedopt setdelay crystal|anchor <level> <ticks>
+.speedopt toggle | togglecrystal | toggleanchor | status
+
+10 = fastest (0 ticks), 1 = slowest. Config: .minecraft/config/speedoptimizer.json
+
+## Get the .jar without installing anything (GitHub)
+1. Make a free GitHub account, create a new repository, and upload everything in this folder
+   (keep the .github folder).
+2. Open the Actions tab -> "Build mod jar" -> wait for the green check.
+3. Open the finished run, download "speedoptimizer-jar" at the bottom, unzip it.
+   Use the file that does NOT end in -sources.jar. Put it in .minecraft/mods.
+
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+package com.speedopt;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+
+public class SpeedOpt implements ClientModInitializer {
+    public static Config config;
+
+    @Override
+    public void onInitializeClient() {
+        config = Config.load();
+    }
+
+    /** Current world time in ticks (0 if not in a world). */
+    public static long now() {
+        Minecraft mc = Minecraft.getInstance();
+        return mc.level == null ? 0 : mc.level.getGameTime();
+    }
+
+    public static void say(String s) {
+        Minecraft.getInstance().gui.getChat().addMessage(Component.literal("[SpeedOpt] " + s));
+    }
+
+    /**
+     * Chat commands (start with a dot, never sent to the server):
+     *   .speedopt crystal <1-10>
+     *   .speedopt anchor <1-10>
+     *   .speedopt setdelay crystal|anchor <level> <ticks>
+     *   .speedopt toggle | togglecrystal | toggleanchor | status
+     * Returns true if the message was a SpeedOpt command.
+     */
+    public static boolean handle(String msg) {
+        if (!msg.toLowerCase().startsWith(".speedopt")) return false;
+        String[] a = msg.trim().split("\\s+");
+        try {
+            if (a.length >= 3 && a[1].equalsIgnoreCase("crystal")) {
+                config.crystalLevel = range(a[2], 1, 10);
+                say("Crystal speed = " + config.crystalLevel + " (delay " + config.crystalDelay() + " ticks)");
+            } else if (a.length >= 3 && a[1].equalsIgnoreCase("anchor")) {
+                config.anchorLevel = range(a[2], 1, 10);
+                say("Anchor speed = " + config.anchorLevel + " (delay " + config.anchorDelay() + " ticks)");
+            } else if (a.length >= 5 && a[1].equalsIgnoreCase("setdelay")) {
+                int lvl = range(a[3], 1, 10);
+                int t = range(a[4], 0, 40);
+                if (a[2].equalsIgnoreCase("crystal")) config.crystalDelays[lvl - 1] = t;
+                else if (a[2].equalsIgnoreCase("anchor")) config.anchorDelays[lvl - 1] = t;
+                else { say("Use: .speedopt setdelay crystal|anchor <level> <ticks>"); return true; }
+                say(a[2] + " level " + lvl + " delay = " + t + " ticks");
+            } else if (a.length >= 2 && a[1].equalsIgnoreCase("toggle")) {
+                config.enabled = !config.enabled;
+                say("Speed Optimizer " + (config.enabled ? "ON" : "OFF"));
+            } else if (a.length >= 2 && a[1].equalsIgnoreCase("togglecrystal")) {
+                config.crystalEnabled = !config.crystalEnabled;
+                say("Crystal optimizer " + (config.crystalEnabled ? "ON" : "OFF"));
+            } else if (a.length >= 2 && a[1].equalsIgnoreCase("toggleanchor")) {
+                config.anchorEnabled = !config.anchorEnabled;
+                say("Anchor optimizer " + (config.anchorEnabled ? "ON" : "OFF"));
+            } else if (a.length >= 2 && a[1].equalsIgnoreCase("status")) {
+                say("Enabled: " + config.enabled);
+                say("Crystal: " + (config.crystalEnabled ? "ON" : "OFF") + " | level " + config.crystalLevel
+                        + " | delay " + config.crystalDelay() + "t");
+                say("Anchor: " + (config.anchorEnabled ? "ON" : "OFF") + " | level " + config.anchorLevel
+                        + " | delay " + config.anchorDelay() + "t");
+            } else {
+                say("Commands: crystal <1-10>, anchor <1-10>, setdelay crystal|anchor <level> <ticks>, toggle, togglecrystal, toggleanchor, status");
+            }
+            config.save();
+        } catch (NumberFormatException e) {
+            say("That needs to be a number in range.");
+        }
+        return true;
+    }
+
+    private static int range(String s, int lo, int hi) {
+        int v = Integer.parseInt(s);
+        if (v < lo || v > hi) throw new NumberFormatException();
+        return v;
+    }
+}
+
+{
+  "required": true,
+  "package": "com.speedopt.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["InteractionManagerMixin", "ChatMixin"],
+  "injectors": { "defaultRequire": 1 }
+}
+
+name: Build mod jar
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedoptimizer-jar
+          path: build/libs/*.jar
+
+name: Build mod jar
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedoptimizer-jar
+          path: build/libs/*.jar
+
+plugins {
+    id 'fabric-loom' version '1.14-SNAPSHOT'
+}
+
+version = "${project.mod_version}+mc${project.mc}"
+group = 'com.speedopt'
+base { archivesName = 'speedoptimizer' }
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.mc}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") { expand "version": project.version }
+}
+
+tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+package com.speedopt.mixin;
+
+import com.speedopt.SpeedOpt;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+/** Intercepts ".speedopt ..." chat messages so they never reach the server. */
+@Mixin(ClientPacketListener.class)
+public class ChatMixin {
+    @Inject(method = "sendChat", at = @At("HEAD"), cancellable = true)
+    private void speedopt$chat(String message, CallbackInfo ci) {
+        if (SpeedOpt.handle(message)) ci.cancel();
+    }
+}
+
+package com.speedopt;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.fabricmc.loader.api.FabricLoader;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/** Saved to .minecraft/config/speedoptimizer.json. Delays are in ticks (20 ticks = 1 second). */
+public class Config {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("speedoptimizer.json");
+
+    public boolean enabled = true;
+    public boolean crystalEnabled = true;
+    public boolean anchorEnabled = true;
+
+    public int crystalLevel = 10;
+    public int anchorLevel = 10;
+
+    // Index 0 = level 1 (slowest) ... index 9 = level 10 (fastest, 0 delay)
+    public int[] crystalDelays = {10, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+    public int[] anchorDelays  = {12, 10, 8, 7, 6, 5, 4, 3, 1, 0};
+
+    public int crystalDelay() { return crystalDelays[clamp(crystalLevel) - 1]; }
+    public int anchorDelay()  { return anchorDelays[clamp(anchorLevel) - 1]; }
+
+    public static int clamp(int lvl) { return Math.max(1, Math.min(10, lvl)); }
+
+    public static Config load() {
+        try {
+            if (Files.exists(FILE)) {
+                Config c = GSON.fromJson(Files.readString(FILE), Config.class);
+                if (c != null && c.crystalDelays != null && c.crystalDelays.length == 10
+                        && c.anchorDelays != null && c.anchorDelays.length == 10) {
+                    c.crystalLevel = clamp(c.crystalLevel);
+                    c.anchorLevel = clamp(c.anchorLevel);
+                    return c;
+                }
+            }
+        } catch (Exception ignored) {}
+        Config c = new Config();
+        c.save();
+        return c;
+    }
+
+    public void save() {
+        try { Files.writeString(FILE, GSON.toJson(this)); } catch (IOException ignored) {}
+    }
+}
+
+{
+  "schemaVersion": 1,
+  "id": "speedoptimizer",
+  "version": "${version}",
+  "name": "Speed Optimizer",
+  "description": "Crystal and Anchor optimizer with customizable speed levels 1-10.",
+  "environment": "client",
+  "entrypoints": { "client": ["com.speedopt.SpeedOpt"] },
+  "mixins": ["speedoptimizer.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "1.21.11",
+    "java": ">=21"
+  }
+}
